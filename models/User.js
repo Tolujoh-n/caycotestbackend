@@ -50,6 +50,8 @@ const UserSchema = new mongoose.Schema({
   },
   inviteToken: String,
   inviteTokenExpire: Date,
+  resetPasswordToken: String,
+  resetPasswordExpire: Date,
   onboardingCompleted: {
     type: Boolean,
     default: false
@@ -79,7 +81,8 @@ UserSchema.methods.matchPassword = async function(enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
 
-// Index for email uniqueness per company (users can exist in multiple companies with same email)
-UserSchema.index({ email: 1, companyId: 1 }, { unique: true });
+// Index for email (users can exist in multiple companies with same email)
+// Uniqueness is enforced by UserOrganization model
+UserSchema.index({ email: 1 });
 
 module.exports = mongoose.model('User', UserSchema);
