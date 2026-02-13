@@ -269,7 +269,13 @@ router.post('/invite', protect, async (req, res) => {
     });
 
     // Send invite email with organization ID
-    await sendInviteEmail(email, company.name, role, inviteToken, company.organizationId);
+    const emailResult = await sendInviteEmail(email, company.name, role, inviteToken, company.organizationId);
+    
+    if (!emailResult.success) {
+      console.error('Failed to send invitation email:', emailResult.error);
+      // Still return success to user, but log the error
+      // The user was created and can be invited again if needed
+    }
 
     // Create notification (will be available after user accepts invite)
     const notification = notificationTemplates.userInvited(email, role, company.name);
@@ -425,11 +431,18 @@ router.post('/forgot-organization-id', async (req, res) => {
     }
 
     // Send email with organization IDs
-    await sendForgotOrgIdEmail(email, userOrgs.map(uo => ({
+    const emailResult = await sendForgotOrgIdEmail(email, userOrgs.map(uo => ({
       name: uo.companyId.name,
       organizationId: uo.companyId.organizationId,
       role: uo.role
     })));
+
+    if (!emailResult.success) {
+      console.error('Failed to send organization ID email:', emailResult.error);
+      return res.status(500).json({ 
+        message: 'Failed to send email. Please contact support or try again later.' 
+      });
+    }
 
     res.json({
       success: true,
@@ -490,7 +503,18 @@ router.post('/forgot-password', async (req, res) => {
     await user.save({ validateBeforeSave: false });
 
     // Send reset email
-    await sendPasswordResetEmail(email, company.name, resetToken, company.organizationId);
+    const emailResult = await sendPasswordResetEmail(email, company.name, resetToken, company.organizationId);
+
+    if (!emailResult.success) {
+      console.error('Failed to send password reset email:', emailResult.error);
+      // Reset the token since email failed
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpire = undefined;
+      await user.save({ validateBeforeSave: false });
+      return res.status(500).json({ 
+        message: 'Failed to send reset email. Please try again later.' 
+      });
+    }
 
     res.json({
       success: true,

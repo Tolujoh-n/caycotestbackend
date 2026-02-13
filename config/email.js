@@ -1,30 +1,92 @@
 const nodemailer = require('nodemailer');
 
+// Determine if we should use secure connection (port 465) or STARTTLS (port 587)
+const emailPort = parseInt(process.env.EMAIL_PORT || '587', 10);
+const useSecure = emailPort === 465;
+
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-  port: process.env.EMAIL_PORT || 587,
-  secure: false,
+  port: emailPort,
+  secure: useSecure, // true for 465, false for other ports
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
   },
+  tls: {
+    // Allow self-signed certificates if EMAIL_TLS_REJECT_UNAUTHORIZED is not set to 'true'
+    // Set EMAIL_TLS_REJECT_UNAUTHORIZED=true in production for strict certificate validation
+    rejectUnauthorized: process.env.EMAIL_TLS_REJECT_UNAUTHORIZED === 'true',
+  },
+  // Additional options for better compatibility
+  requireTLS: !useSecure, // Require TLS for non-secure ports
+  connectionTimeout: 10000, // 10 seconds
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
+  // Debug mode for development
+  debug: process.env.NODE_ENV === 'development',
+  logger: process.env.NODE_ENV === 'development'
 });
+
+// Verify transporter configuration
+const verifyTransporter = async () => {
+  try {
+    await transporter.verify();
+    console.log('Email server is ready to send messages');
+    return true;
+  } catch (error) {
+    console.error('Email server verification failed:', error);
+    return false;
+  }
+};
+
+// Verify on startup (only in production to avoid blocking)
+if (process.env.NODE_ENV === 'production') {
+  verifyTransporter().catch(err => {
+    console.error('Email verification error:', err);
+  });
+}
 
 const sendEmail = async (to, subject, html) => {
   try {
+    // Validate email configuration
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      console.error('Email credentials not configured');
+      return { 
+        success: false, 
+        error: 'Email service not configured. Please set EMAIL_USER and EMAIL_PASS environment variables.' 
+      };
+    }
+
     const mailOptions = {
-      from: process.env.EMAIL_FROM || 'Cayco <noreply@cayco.com>',
+      from: process.env.EMAIL_FROM || `Cayco <${process.env.EMAIL_USER}>`,
       to,
       subject,
       html,
+      // Additional options for better deliverability
+      headers: {
+        'X-Priority': '1',
+        'X-MSMail-Priority': 'High',
+        'Importance': 'high'
+      }
     };
 
     const info = await transporter.sendMail(mailOptions);
-    console.log('Email sent:', info.messageId);
+    console.log('Email sent successfully:', info.messageId);
+    console.log('Email sent to:', to);
     return { success: true, messageId: info.messageId };
   } catch (error) {
-    console.error('Email error:', error);
-    return { success: false, error: error.message };
+    console.error('Email sending error:', error);
+    console.error('Error details:', {
+      code: error.code,
+      command: error.command,
+      response: error.response,
+      responseCode: error.responseCode
+    });
+    return { 
+      success: false, 
+      error: error.message,
+      details: process.env.NODE_ENV === 'development' ? error : undefined
+    };
   }
 };
 
