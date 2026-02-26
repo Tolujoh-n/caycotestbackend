@@ -61,17 +61,29 @@ The system will automatically use `secure: false` with `requireTLS: true` for po
 
 ## Troubleshooting
 
-If emails are not sending in production:
+### Connection timeout (ETIMEDOUT)
 
-1. **Check environment variables** - Ensure all email-related env vars are set
-2. **Check logs** - Look for email error messages in server logs
-3. **Verify SMTP credentials** - Test with a simple email client first
-4. **Check firewall** - Ensure your hosting provider allows outbound SMTP connections
-5. **Port restrictions** - Some hosting providers block port 587, try 465 instead
-6. **TLS/SSL issues** - The configuration automatically handles TLS based on port
+If you see `Connection timeout` or `ETIMEDOUT` when sending mail:
+
+1. **Firewall / antivirus** – Windows Defender or other antivirus often blocks outbound SMTP. Temporarily allow Node/your app through the firewall or add an exception for outbound port 587 (or 465).
+2. **Port 587 blocked** – Many home ISPs block port 587. Try SSL on port 465:
+   - In `.env` set `EMAIL_PORT=465` (no quotes).
+   - Restart the backend. The app uses SSL automatically when port is 465.
+3. **No quotes in .env** – Use `EMAIL_HOST=smtp.gmail.com` not `EMAIL_HOST='smtp.gmail.com'`. Quotes can break the hostname.
+4. **Dev without real email** – To keep invites working when SMTP is blocked (e.g. on your PC), set in `.env`:
+   - `EMAIL_DEV_SKIP_SEND=true`
+   - The app will not connect to SMTP; it will log the invite/reset link to the console so you can copy it and open in the browser. Invites and registration still “succeed” in the UI.
+
+### Other issues
+
+1. **Check environment variables** – Ensure `EMAIL_USER` and `EMAIL_PASS` are set (and, for Gmail, use an [App Password](https://support.google.com/accounts/answer/185833)).
+2. **Check logs** – Look for email error messages in server logs.
+3. **Verify SMTP** – Test the same host/port/user/pass in another client (e.g. Thunderbird) from the same network.
+4. **Port restrictions** – If 587 fails, try `EMAIL_PORT=465`.
 
 ## Testing
 
-The email service will verify the connection on startup in production mode. Check your server logs for:
-- "Email server is ready to send messages" (success)
-- "Email server verification failed" (check credentials/network)
+The email service verifies the connection on startup in production. Check server logs for:
+
+- `Email server is ready to send messages` (success)
+- `Email server verification failed` (check credentials/network)

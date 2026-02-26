@@ -19,6 +19,9 @@ const UserOrganizationSchema = new mongoose.Schema({
     enum: ['Company Owner', 'Operations Manager', 'Estimator', 'Accountant', 'Staff', 'Client'],
     required: true
   },
+  // Display name for this organization (set when accepting invite; used when logging into this org)
+  firstName: { type: String, default: '' },
+  lastName: { type: String, default: '' },
   status: {
     type: String,
     enum: ['pending', 'active', 'inactive'],
@@ -31,6 +34,13 @@ const UserOrganizationSchema = new mongoose.Schema({
   joinedAt: {
     type: Date,
     default: Date.now
+  },
+  registrationEmailSent: {
+    type: Boolean,
+    default: false
+  },
+  registrationEmailSentAt: {
+    type: Date
   },
   createdAt: {
     type: Date,

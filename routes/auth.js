@@ -6,7 +6,7 @@ const User = require('../models/User');
 const Company = require('../models/Company');
 const UserOrganization = require('../models/UserOrganization');
 const { protect } = require('../middleware/auth');
-const { sendInviteEmail, sendForgotOrgIdEmail, sendPasswordResetEmail } = require('../config/email');
+const { sendInviteEmail, sendForgotOrgIdEmail, sendPasswordResetEmail, sendRegistrationEmail } = require('../config/email');
 const { createNotificationWithEmail, notificationTemplates } = require('../utils/notifications');
 
 // Generate JWT Token
@@ -35,43 +35,87 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ message: 'Please provide all required fields' });
     }
 
-    // Create user first with temporary companyId
-    const mongoose = require('mongoose');
-    const tempCompanyId = new mongoose.Types.ObjectId();
+    // Check if user with this email already exists
+    let user = await User.findOne({ email: email.toLowerCase() });
     
-    const user = await User.create({
-      email,
-      password,
-      firstName,
-      lastName,
-      phone: phone || undefined,
-      role: 'Company Owner',
-      companyId: tempCompanyId // Temporary, will be updated
-    });
+    if (!user) {
+      // Create new user with temporary companyId
+      const mongoose = require('mongoose');
+      const tempCompanyId = new mongoose.Types.ObjectId();
+      
+      try {
+        user = await User.create({
+          email: email.toLowerCase(),
+          password,
+          firstName,
+          lastName,
+          phone: phone || undefined,
+          role: 'Company Owner',
+          companyId: tempCompanyId // Temporary, will be updated
+        });
+      } catch (createError) {
+        // If duplicate key error, user was created between check and create (race condition)
+        // Try to find the user again
+        if (createError.code === 11000) {
+          user = await User.findOne({ email: email.toLowerCase() });
+          if (!user) {
+            throw createError; // If still not found, re-throw the error
+          }
+        } else {
+          throw createError; // Re-throw if it's a different error
+        }
+      }
+    }
+    // If user exists, we use the existing user (don't update password for security)
 
     // Create company with owner (organizationId will be auto-generated)
     const company = await Company.create({
       name: companyName,
-      email,
+      email: email.toLowerCase(),
       phone: phone || undefined,
       owner: user._id
     });
 
-    // Update user with correct companyId
+    // Update user with correct companyId (set to the new company)
     user.companyId = company._id;
-    await user.save();
+    await user.save({ validateBeforeSave: false });
 
-    // Create UserOrganization entry
-    await UserOrganization.create({
+    // Check if UserOrganization entry already exists
+    const existingUserOrg = await UserOrganization.findOne({
       userId: user._id,
-      companyId: company._id,
-      role: 'Company Owner',
-      status: 'active',
-      joinedAt: new Date()
+      companyId: company._id
     });
+
+    if (!existingUserOrg) {
+      // Create UserOrganization entry
+      await UserOrganization.create({
+        userId: user._id,
+        companyId: company._id,
+        role: 'Company Owner',
+        status: 'active',
+        joinedAt: new Date(),
+        registrationEmailSent: false // Will be sent when onboarding is completed
+      });
+    } else {
+      // Update existing entry to active if it was inactive
+      existingUserOrg.status = 'active';
+      existingUserOrg.role = 'Company Owner';
+      existingUserOrg.joinedAt = new Date();
+      // Reset registration email flag for new organization registration
+      // This ensures email is sent even if user previously had this organization
+      existingUserOrg.registrationEmailSent = false;
+      existingUserOrg.registrationEmailSentAt = undefined;
+      await existingUserOrg.save();
+    }
+
+    // For new organizations, we don't need to reset user.onboardingCompleted
+    // because onboarding status is now checked per-organization via UserOrganization.registrationEmailSent
+    // The user will be redirected to onboarding based on the organization-specific status
 
     // Generate token
     const token = generateToken(user._id);
+
+    // Don't send registration email here - it will be sent when onboarding is completed
 
     res.status(201).json({
       success: true,
@@ -125,8 +169,9 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'Invalid organization ID' });
     }
 
-    // Check for user
-    const user = await User.findOne({ email }).select('+password');
+    // Check for user (normalize email - DB stores lowercase)
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await User.findOne({ email: normalizedEmail }).select('+password');
     if (!user) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
@@ -168,14 +213,18 @@ router.post('/login', async (req, res) => {
     // Generate token (include companyId in token payload for context)
     const token = generateToken(user._id);
 
+    // Use per-organization display name when set (e.g. after accepting invite), else User name
+    const displayFirstName = (userOrg.firstName && userOrg.firstName.trim()) ? userOrg.firstName.trim() : user.firstName;
+    const displayLastName = (userOrg.lastName && userOrg.lastName.trim()) ? userOrg.lastName.trim() : user.lastName;
+
     res.json({
       success: true,
       token,
       user: {
         id: user._id,
         email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
+        firstName: displayFirstName,
+        lastName: displayLastName,
         role: userOrg.role,
         companyId: company._id,
         organizationId: company.organizationId
@@ -217,15 +266,25 @@ router.post('/invite', protect, async (req, res) => {
       return res.status(400).json({ message: 'Invalid role. Role must be a system role or a custom role in your company.' });
     }
 
-    // Check if user already exists in this company via UserOrganization
+    // Get company
+    const company = await Company.findById(req.user.companyId);
+    if (!company) {
+      return res.status(404).json({ message: 'Company not found' });
+    }
+
+    // Check if user already exists
     const existingUser = await User.findOne({ email });
+    
+    // Check for existing UserOrganization entry (including inactive ones for re-invites)
+    let existingUserOrg = null;
     if (existingUser) {
-      const existingUserOrg = await UserOrganization.findOne({
+      existingUserOrg = await UserOrganization.findOne({
         userId: existingUser._id,
-        companyId: req.user.companyId,
-        status: { $in: ['active', 'pending'] }
+        companyId: req.user.companyId
       });
-      if (existingUserOrg) {
+      
+      // If user is already active or pending, don't allow re-invite
+      if (existingUserOrg && (existingUserOrg.status === 'active' || existingUserOrg.status === 'pending')) {
         return res.status(400).json({ message: 'User with this email already exists in your company' });
       }
     }
@@ -233,12 +292,6 @@ router.post('/invite', protect, async (req, res) => {
     // Generate invite token
     const inviteToken = crypto.randomBytes(32).toString('hex');
     const inviteTokenExpire = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
-
-    // Get company
-    const company = await Company.findById(req.user.companyId);
-    if (!company) {
-      return res.status(404).json({ message: 'Company not found' });
-    }
 
     // Create or get user
     let user = existingUser;
@@ -252,21 +305,32 @@ router.post('/invite', protect, async (req, res) => {
         password: crypto.randomBytes(20).toString('hex') // Temporary password
       });
     } else {
-      // Update existing user with invite token
+      // Update existing user with invite token only - do NOT overwrite companyId/role
+      // so their membership in other orgs (e.g. Company Owner elsewhere) stays correct
       user.inviteToken = inviteToken;
       user.inviteTokenExpire = inviteTokenExpire;
-      user.companyId = req.user.companyId;
+      user.isActive = true; // Reactivate user if they were deactivated
       await user.save({ validateBeforeSave: false });
     }
 
-    // Create UserOrganization entry
-    await UserOrganization.create({
-      userId: user._id,
-      companyId: req.user.companyId,
-      role,
-      status: 'pending',
-      invitedBy: req.user.id
-    });
+    // Create or reactivate UserOrganization entry
+    if (existingUserOrg) {
+      // Reactivate existing entry (user was previously removed)
+      existingUserOrg.status = 'pending';
+      existingUserOrg.role = role;
+      existingUserOrg.invitedBy = req.user.id;
+      existingUserOrg.joinedAt = undefined; // Reset joinedAt since they need to accept invite again
+      await existingUserOrg.save();
+    } else {
+      // Create new UserOrganization entry
+      await UserOrganization.create({
+        userId: user._id,
+        companyId: req.user.companyId,
+        role,
+        status: 'pending',
+        invitedBy: req.user.id
+      });
+    }
 
     // Send invite email with organization ID
     const emailResult = await sendInviteEmail(email, company.name, role, inviteToken, company.organizationId);
@@ -287,7 +351,7 @@ router.post('/invite', protect, async (req, res) => {
       user: {
         id: user._id,
         email: user.email,
-        role: user.role
+        role // role in this organization (from UserOrganization)
       }
     });
   } catch (error) {
@@ -347,34 +411,30 @@ router.post('/accept-invite', async (req, res) => {
       return res.status(400).json({ message: 'Invalid or expired invitation token' });
     }
 
+    // Find the pending UserOrganization (the invite they're accepting)
+    const userOrg = await UserOrganization.findOne({
+      userId: user._id,
+      status: 'pending'
+    });
+    if (!userOrg) {
+      return res.status(400).json({ message: 'No pending invitation found' });
+    }
+
     // Update user with provided information
     user.password = password;
-    user.firstName = firstName.trim();
-    user.lastName = lastName.trim();
+    if (!(user.firstName && user.firstName.trim())) user.firstName = firstName.trim();
+    if (!(user.lastName && user.lastName.trim())) user.lastName = lastName.trim();
     user.inviteToken = undefined;
     user.inviteTokenExpire = undefined;
     user.isActive = true;
+    user.companyId = userOrg.companyId;
     await user.save();
 
-    // Update UserOrganization status to active
-    const userOrg = await UserOrganization.findOne({
-      userId: user._id,
-      companyId: user.companyId
-    });
-    if (userOrg) {
-      userOrg.status = 'active';
-      userOrg.joinedAt = new Date();
-      await userOrg.save();
-    } else {
-      // Create UserOrganization entry if it doesn't exist
-      await UserOrganization.create({
-        userId: user._id,
-        companyId: user.companyId,
-        role: user.role,
-        status: 'active',
-        joinedAt: new Date()
-      });
-    }
+    userOrg.firstName = firstName.trim();
+    userOrg.lastName = lastName.trim();
+    userOrg.status = 'active';
+    userOrg.joinedAt = new Date();
+    await userOrg.save();
 
     // Get company for organizationId
     const company = await Company.findById(user.companyId);
@@ -388,9 +448,9 @@ router.post('/accept-invite', async (req, res) => {
       user: {
         id: user._id,
         email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role,
+        firstName: userOrg.firstName,
+        lastName: userOrg.lastName,
+        role: userOrg.role,
         companyId: user.companyId,
         organizationId: company?.organizationId
       }
@@ -405,29 +465,36 @@ router.post('/accept-invite', async (req, res) => {
 // @access  Public
 router.post('/forgot-organization-id', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Please provide email and password' });
+    if (!email) {
+      return res.status(400).json({ message: 'Please provide your email address' });
     }
 
-    // Find user and verify password
-    const user = await User.findOne({ email }).select('+password');
-    if (!user) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+    // Find all users with this email (in case there are multiple)
+    const users = await User.find({ email: email.toLowerCase() });
+
+    if (users.length === 0) {
+      // Don't reveal if email exists for security - just send success message
+      return res.json({
+        success: true,
+        message: 'If an account exists with this email, organization IDs have been sent'
+      });
     }
 
-    const isPasswordMatch = await user.matchPassword(password);
-    if (!isPasswordMatch) {
-      return res.status(401).json({ message: 'Invalid credentials' });
-    }
-
-    // Get all organizations user belongs to
-    const userOrgs = await UserOrganization.find({ userId: user._id, status: 'active' })
-      .populate('companyId');
+    // Get all organizations for all users with this email
+    const userIds = users.map(u => u._id);
+    const userOrgs = await UserOrganization.find({ 
+      userId: { $in: userIds }, 
+      status: 'active' 
+    }).populate('companyId');
 
     if (userOrgs.length === 0) {
-      return res.status(404).json({ message: 'No organizations found for this account' });
+      // Don't reveal if email exists for security - just send success message
+      return res.json({
+        success: true,
+        message: 'If an account exists with this email, organization IDs have been sent'
+      });
     }
 
     // Send email with organization IDs
@@ -636,6 +703,7 @@ router.delete('/user/:userId', protect, async (req, res) => {
     await deleteUserOrg.save();
 
     // If user has no other active organizations, deactivate the user account
+    // But keep companyId so they can be re-invited
     const otherOrgs = await UserOrganization.find({
       userId: userId,
       status: 'active',
@@ -644,7 +712,8 @@ router.delete('/user/:userId', protect, async (req, res) => {
 
     if (otherOrgs.length === 0) {
       userToDelete.isActive = false;
-      userToDelete.companyId = undefined;
+      // Keep companyId so user can be re-invited to the same organization
+      // It will be updated when they accept the new invite
       await userToDelete.save({ validateBeforeSave: false });
     } else {
       // Update companyId to another active organization
@@ -667,16 +736,30 @@ router.delete('/user/:userId', protect, async (req, res) => {
 // @access  Private
 router.get('/me', protect, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).populate('companyId');
+    const user = await User.findById(req.user.id).populate('companyId').select('-password');
+
+    let displayFirstName = user.firstName;
+    let displayLastName = user.lastName;
+    if (user.companyId) {
+      const userOrg = await UserOrganization.findOne({
+        userId: user._id,
+        companyId: user.companyId,
+        status: 'active'
+      });
+      if (userOrg) {
+        if (userOrg.firstName && userOrg.firstName.trim()) displayFirstName = userOrg.firstName.trim();
+        if (userOrg.lastName && userOrg.lastName.trim()) displayLastName = userOrg.lastName.trim();
+      }
+    }
 
     res.json({
       success: true,
       user: {
         id: user._id,
         email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role,
+        firstName: displayFirstName,
+        lastName: displayLastName,
+        role: req.user.role,
         companyId: user.companyId,
         phone: user.phone,
         avatar: user.avatar,

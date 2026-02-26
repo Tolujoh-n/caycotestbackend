@@ -4,7 +4,9 @@ const User = require('../models/User');
 const Company = require('../models/Company');
 const Customer = require('../models/Customer');
 const Estimate = require('../models/Estimate');
+const UserOrganization = require('../models/UserOrganization');
 const { protect } = require('../middleware/auth');
+const { sendRegistrationEmail } = require('../config/email');
 
 // @route   GET /api/onboarding/status
 // @desc    Get onboarding status
@@ -96,6 +98,24 @@ router.get('/status', protect, async (req, res) => {
     const totalSteps = Object.keys(steps).length;
     const progress = (completedSteps / totalSteps) * 100;
 
+    // Check if onboarding is completed for THIS specific organization
+    // This is based on whether registration email has been sent for this organization
+    const userOrg = await UserOrganization.findOne({
+      userId: user._id,
+      companyId: company._id
+    });
+
+    // Onboarding is considered completed for this organization if:
+    // Registration email has been sent (meaning onboarding was completed for this organization)
+    // For new organizations, registrationEmailSent will be false, so onboarding is not completed
+    const onboardingCompletedForOrg = userOrg?.registrationEmailSent === true;
+
+    console.log(`Onboarding status check for user ${user._id}, company ${company._id}:`, {
+      userOrgExists: !!userOrg,
+      registrationEmailSent: userOrg?.registrationEmailSent,
+      onboardingCompletedForOrg
+    });
+
     res.json({
       success: true,
       data: {
@@ -103,7 +123,7 @@ router.get('/status', protect, async (req, res) => {
         progress,
         completedSteps,
         totalSteps,
-        onboardingCompleted: user?.onboardingCompleted || false
+        onboardingCompleted: onboardingCompletedForOrg
       }
     });
   } catch (error) {
@@ -145,8 +165,96 @@ router.post('/complete-step', protect, async (req, res) => {
 router.post('/complete', protect, async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
-    user.onboardingCompleted = true;
-    await user.save();
+    const company = await Company.findById(req.user.companyId);
+    
+    if (!company) {
+      return res.status(404).json({ message: 'Company not found' });
+    }
+
+    // Note: We keep user.onboardingCompleted for backward compatibility,
+    // but onboarding status is now checked per-organization via UserOrganization.registrationEmailSent
+    // We still set it to true here for any legacy checks, but the actual onboarding completion
+    // for an organization is determined by registrationEmailSent
+    if (!user.onboardingCompleted) {
+      user.onboardingCompleted = true;
+      await user.save();
+    }
+
+    // Check if registration email has been sent for this specific organization
+    const userOrg = await UserOrganization.findOne({
+      userId: user._id,
+      companyId: company._id
+    });
+
+    // Send registration confirmation email with organization ID when onboarding is completed
+    // Send email for each new organization, regardless of whether user completed onboarding for other organizations
+    const shouldSendEmail = !userOrg || userOrg.registrationEmailSent !== true;
+    
+    console.log(`Onboarding complete check for user ${user._id}, company ${company._id}:`, {
+      userOrgExists: !!userOrg,
+      registrationEmailSent: userOrg?.registrationEmailSent,
+      shouldSendEmail
+    });
+
+    if (shouldSendEmail) {
+      try {
+        console.log(`Sending registration email for organization ${company.organizationId} to ${user.email}`);
+        const emailResult = await sendRegistrationEmail(
+          user.email,
+          user.firstName,
+          user.lastName,
+          company.name,
+          company.organizationId
+        );
+        
+        // Mark that registration email has been sent for this organization
+        // Do this regardless of email success/failure to mark onboarding as complete
+        if (userOrg) {
+          userOrg.registrationEmailSent = true;
+          userOrg.registrationEmailSentAt = new Date();
+          await userOrg.save();
+          console.log('✓ UserOrganization updated with registrationEmailSent = true');
+        } else {
+          // Create UserOrganization entry if it doesn't exist (shouldn't happen, but just in case)
+          await UserOrganization.create({
+            userId: user._id,
+            companyId: company._id,
+            role: user.role || 'Company Owner',
+            status: 'active',
+            registrationEmailSent: true,
+            registrationEmailSentAt: new Date()
+          });
+          console.log('✓ UserOrganization created with registrationEmailSent = true');
+        }
+        
+        if (!emailResult.success) {
+          console.error('Failed to send registration email:', emailResult.error);
+          // Don't fail onboarding completion if email fails, just log it
+        } else {
+          console.log('✓ Registration confirmation email sent successfully for organization:', company.organizationId);
+        }
+      } catch (emailError) {
+        console.error('Error sending registration email:', emailError);
+        // Even if email fails, mark onboarding as complete
+        if (userOrg) {
+          userOrg.registrationEmailSent = true;
+          userOrg.registrationEmailSentAt = new Date();
+          await userOrg.save();
+        } else {
+          await UserOrganization.create({
+            userId: user._id,
+            companyId: company._id,
+            role: user.role || 'Company Owner',
+            status: 'active',
+            registrationEmailSent: true,
+            registrationEmailSentAt: new Date()
+          });
+        }
+        // Don't fail onboarding completion if email fails, just log it
+      }
+    } else {
+      console.log(`Registration email already sent for organization ${company.organizationId}, skipping...`);
+    }
 
     res.json({
       success: true,

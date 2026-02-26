@@ -2,24 +2,39 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const User = require('../models/User');
+const UserOrganization = require('../models/UserOrganization');
 const { protect, authorize, tenantIsolation } = require('../middleware/auth');
 const { uploadImage, deleteImage } = require('../utils/cloudinary');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 // @route   GET /api/users
-// @desc    Get all users in company
+// @desc    Get all users in company (role = per-organization role from UserOrganization)
 // @access  Private
 router.get('/', protect, tenantIsolation, async (req, res) => {
   try {
-    const users = await User.find({ companyId: req.user.companyId })
-      .select('-password')
-      .populate('roles', 'name description isSystemRole');
+    const companyId = req.user.companyId;
+    const userOrgs = await UserOrganization.find({
+      companyId,
+      status: { $in: ['active', 'pending'] }
+    })
+      .populate({
+        path: 'userId',
+        select: '-password',
+        populate: { path: 'roles', select: 'name description isSystemRole' }
+      });
+
+    const data = userOrgs
+      .filter((uo) => uo.userId)
+      .map((uo) => {
+        const u = uo.userId.toObject ? uo.userId.toObject() : uo.userId;
+        return Object.assign({}, u, { role: uo.role });
+      });
 
     res.json({
       success: true,
-      count: users.length,
-      data: users
+      count: data.length,
+      data
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -27,22 +42,24 @@ router.get('/', protect, tenantIsolation, async (req, res) => {
 });
 
 // @route   GET /api/users/:id
-// @desc    Get single user
+// @desc    Get single user in this organization (role = per-org role)
 // @access  Private
 router.get('/:id', protect, tenantIsolation, async (req, res) => {
   try {
-    const user = await User.findOne({
-      _id: req.params.id,
-      companyId: req.user.companyId
-    }).select('-password');
+    const userOrg = await UserOrganization.findOne({
+      userId: req.params.id,
+      companyId: req.user.companyId,
+      status: { $in: ['active', 'pending'] }
+    }).populate('userId', '-password');
 
-    if (!user) {
+    if (!userOrg || !userOrg.userId) {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    const user = userOrg.userId.toObject ? userOrg.userId.toObject() : userOrg.userId;
     res.json({
       success: true,
-      data: user
+      data: Object.assign({}, user, { role: userOrg.role })
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -50,15 +67,21 @@ router.get('/:id', protect, tenantIsolation, async (req, res) => {
 });
 
 // @route   PUT /api/users/:id
-// @desc    Update user
+// @desc    Update user (must be member of this organization)
 // @access  Private
 router.put('/:id', protect, tenantIsolation, async (req, res) => {
   try {
-    const user = await User.findOne({
-      _id: req.params.id,
-      companyId: req.user.companyId
+    const userOrg = await UserOrganization.findOne({
+      userId: req.params.id,
+      companyId: req.user.companyId,
+      status: { $in: ['active', 'pending'] }
     });
 
+    if (!userOrg) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = await User.findById(req.params.id);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -75,9 +98,11 @@ router.put('/:id', protect, tenantIsolation, async (req, res) => {
 
     await user.save();
 
+    const data = user.toObject ? user.toObject() : user;
+    delete data.password;
     res.json({
       success: true,
-      data: user
+      data: Object.assign({}, data, { role: userOrg.role })
     });
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -153,7 +178,7 @@ router.put('/profile/update', protect, async (req, res) => {
         lastName: user.lastName,
         phone: user.phone,
         avatar: user.avatar,
-        role: user.role,
+        role: req.user.role,
         emailNotifications: user.emailNotifications
       }
     });

@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const UserOrganization = require('../models/UserOrganization');
 
 // Protect routes
 exports.protect = async (req, res, next) => {
@@ -21,6 +22,18 @@ exports.protect = async (req, res, next) => {
       
       if (!req.user) {
         return res.status(401).json({ message: 'User not found' });
+      }
+
+      // Use per-organization role when user has a company (not Super Admin)
+      if (req.user.role !== 'Super Admin' && req.user.companyId) {
+        const userOrg = await UserOrganization.findOne({
+          userId: req.user._id,
+          companyId: req.user.companyId,
+          status: 'active'
+        });
+        if (userOrg) {
+          req.user.role = userOrg.role;
+        }
       }
 
       next();

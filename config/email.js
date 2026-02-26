@@ -1,28 +1,34 @@
 const nodemailer = require('nodemailer');
 
+// Trim env values (in case .env has quotes like EMAIL_HOST='smtp.gmail.com')
+const env = (key, def) => {
+  const v = process.env[key];
+  if (v == null || v === '') return def;
+  const trimmed = typeof v === 'string' ? v.trim().replace(/^['"]|['"]$/g, '') : v;
+  return trimmed || def;
+};
+
 // Determine if we should use secure connection (port 465) or STARTTLS (port 587)
-const emailPort = parseInt(process.env.EMAIL_PORT || '587', 10);
+const emailPort = parseInt(env('EMAIL_PORT', '587'), 10);
 const useSecure = emailPort === 465;
 
 const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+  host: env('EMAIL_HOST', 'smtp.gmail.com'),
   port: emailPort,
   secure: useSecure, // true for 465, false for other ports
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
+    user: env('EMAIL_USER', ''),
+    pass: env('EMAIL_PASS', ''),
   },
   tls: {
-    // Allow self-signed certificates if EMAIL_TLS_REJECT_UNAUTHORIZED is not set to 'true'
-    // Set EMAIL_TLS_REJECT_UNAUTHORIZED=true in production for strict certificate validation
     rejectUnauthorized: process.env.EMAIL_TLS_REJECT_UNAUTHORIZED === 'true',
   },
-  // Additional options for better compatibility
-  requireTLS: !useSecure, // Require TLS for non-secure ports
-  connectionTimeout: 10000, // 10 seconds
-  greetingTimeout: 10000,
-  socketTimeout: 10000,
-  // Debug mode for development
+  requireTLS: !useSecure,
+  // Longer timeouts for slow/firewalled networks (ETIMEDOUT often = firewall/ISP blocking SMTP)
+  connectionTimeout: 20000,
+  greetingTimeout: 15000,
+  socketTimeout: 25000,
+  pool: false, // avoid connection reuse issues that can cause timeouts
   debug: process.env.NODE_ENV === 'development',
   logger: process.env.NODE_ENV === 'development'
 });
@@ -46,29 +52,41 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
+// When true, skip actual SMTP send and log content (for dev when SMTP is blocked by firewall/ISP)
+const skipSend = process.env.EMAIL_DEV_SKIP_SEND === 'true' || process.env.EMAIL_DEV_SKIP_SEND === '1';
+
 const sendEmail = async (to, subject, html) => {
   try {
-    // Validate email configuration
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    const emailUser = env('EMAIL_USER', '');
+    const emailPass = env('EMAIL_PASS', '');
+
+    if (!emailUser || !emailPass) {
       console.error('Email credentials not configured');
-      return { 
-        success: false, 
-        error: 'Email service not configured. Please set EMAIL_USER and EMAIL_PASS environment variables.' 
+      return {
+        success: false,
+        error: 'Email service not configured. Please set EMAIL_USER and EMAIL_PASS environment variables.'
       };
     }
 
     const mailOptions = {
-      from: process.env.EMAIL_FROM || `Cayco <${process.env.EMAIL_USER}>`,
+      from: env('EMAIL_FROM', '') || `Cayco <${emailUser}>`,
       to,
       subject,
       html,
-      // Additional options for better deliverability
       headers: {
         'X-Priority': '1',
         'X-MSMail-Priority': 'High',
         'Importance': 'high'
       }
     };
+
+    if (skipSend) {
+      console.log('[EMAIL_DEV_SKIP_SEND] Skipping send. Would have sent:');
+      console.log('  To:', to, '| Subject:', subject);
+      const linkMatch = html.match(/href="([^"]+)"/);
+      if (linkMatch) console.log('  Link:', linkMatch[1]);
+      return { success: true, messageId: 'dev-skip' };
+    }
 
     const info = await transporter.sendMail(mailOptions);
     console.log('Email sent successfully:', info.messageId);
@@ -82,8 +100,8 @@ const sendEmail = async (to, subject, html) => {
       response: error.response,
       responseCode: error.responseCode
     });
-    return { 
-      success: false, 
+    return {
+      success: false,
       error: error.message,
       details: process.env.NODE_ENV === 'development' ? error : undefined
     };
@@ -242,4 +260,99 @@ const sendPasswordResetEmail = async (email, companyName, resetToken, organizati
   return sendEmail(email, subject, html);
 };
 
-module.exports = { sendEmail, sendInviteEmail, sendForgotOrgIdEmail, sendPasswordResetEmail };
+const sendRegistrationEmail = async (email, firstName, lastName, companyName, organizationId) => {
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const baseUrl = frontendUrl.replace(/\/$/, '');
+  const loginUrl = `${baseUrl}/login`;
+  const settingsUrl = `${baseUrl}/settings`;
+  
+  const subject = 'Welcome to Cayco - Your Account Has Been Created Successfully';
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #d97706 0%, #f59e0b 100%); color: white; padding: 30px 20px; text-align: center; }
+        .content { padding: 30px 20px; background: #f9f9f9; }
+        .button { display: inline-block; padding: 12px 24px; background: #d97706; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+        .org-id-box { background: #fff3cd; border: 2px solid #f59e0b; border-radius: 8px; padding: 20px; margin: 25px 0; text-align: center; }
+        .org-id-text { font-family: 'Courier New', monospace; font-size: 24px; font-weight: bold; color: #92400e; letter-spacing: 2px; }
+        .info-box { background: #e7f3ff; border-left: 4px solid #0066cc; padding: 15px; margin: 20px 0; border-radius: 4px; }
+        .footer { text-align: center; padding: 20px; color: #666; font-size: 12px; }
+        .highlight { color: #d97706; font-weight: bold; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1 style="margin: 0; font-size: 28px;">Cayco Business Operating System</h1>
+        </div>
+        <div class="content">
+          <h2 style="color: #333; margin-top: 0;">Welcome, ${firstName}!</h2>
+          <p>Congratulations! Your account has been successfully created for <strong>${companyName}</strong>.</p>
+          <p>We're excited to have you on board and look forward to helping you streamline your business operations.</p>
+          
+          <div class="org-id-box">
+            <p style="margin: 0 0 15px 0; font-weight: bold; color: #92400e; font-size: 16px;">Your Organization ID</p>
+            <div style="background: white; padding: 15px; border-radius: 5px; margin: 10px 0;">
+              <span class="org-id-text">${organizationId}</span>
+            </div>
+            <p style="margin: 15px 0 0 0; font-size: 14px; color: #78350f; font-weight: 600;">
+              ⚠️ Please save this Organization ID - you'll need it every time you log in!
+            </p>
+          </div>
+          
+          <div class="info-box">
+            <p style="margin: 0 0 10px 0; font-weight: bold; color: #0066cc;">📋 Important Login Information</p>
+            <p style="margin: 5px 0; color: #333;">
+              To access your account, you will need to provide:
+            </p>
+            <ul style="margin: 10px 0; padding-left: 20px; color: #333;">
+              <li>Your <span class="highlight">Organization ID</span>: <strong>${organizationId}</strong></li>
+              <li>Your email address: <strong>${email}</strong></li>
+              <li>Your password (the one you created during registration)</li>
+            </ul>
+          </div>
+          
+          <div class="info-box" style="background: #f0f9ff; border-left-color: #0ea5e9;">
+            <p style="margin: 0 0 10px 0; font-weight: bold; color: #0c4a6e;">💡 Where to Find Your Organization ID</p>
+            <p style="margin: 5px 0; color: #333;">
+              Don't worry if you forget your Organization ID! You can always view it in your <strong>Profile Settings</strong> on the platform.
+            </p>
+            <p style="margin: 10px 0 5px 0; color: #333;">
+              To access it:
+            </p>
+            <ol style="margin: 5px 0; padding-left: 20px; color: #333;">
+              <li>Log in to your Cayco account</li>
+              <li>Click on your profile icon in the top right corner</li>
+              <li>Select <strong>"Settings"</strong> from the dropdown menu</li>
+              <li>Navigate to the <strong>"Profile"</strong> section</li>
+              <li>Your Organization ID will be displayed there</li>
+            </ol>
+          </div>
+          
+          <p style="margin-top: 30px;">Ready to get started? Click the button below to log in to your account:</p>
+          <div style="text-align: center;">
+            <a href="${loginUrl}" class="button" style="background-color: #d97706; color: white; text-decoration: none; border-radius: 5px; padding: 14px 28px; font-weight: bold;">Log In to Your Account</a>
+          </div>
+          
+          <p style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 14px;">
+            If you have any questions or need assistance, please don't hesitate to reach out to our support team. We're here to help!
+          </p>
+        </div>
+        <div class="footer">
+          <p style="margin: 5px 0;">&copy; ${new Date().getFullYear()} Cayco. All rights reserved.</p>
+          <p style="margin: 5px 0; font-size: 11px; color: #999;">
+            This is an automated message. Please do not reply to this email.
+          </p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+  return sendEmail(email, subject, html);
+};
+
+module.exports = { sendEmail, sendInviteEmail, sendForgotOrgIdEmail, sendPasswordResetEmail, sendRegistrationEmail };
