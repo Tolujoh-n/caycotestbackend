@@ -1,89 +1,62 @@
-# Email Configuration for Production
+# Email Configuration (Resend)
 
-## Environment Variables Required
+The platform sends email (invites, password reset, registration, notifications) via [Resend](https://resend.com) using an API key.
 
-Make sure to set these environment variables in your production deployment:
+## Environment Variables
+
+Set these in `.env` (or your deployment environment):
 
 ```
-EMAIL_HOST=smtp.gmail.com
-EMAIL_PORT=587
-EMAIL_USER=your-email@gmail.com
-EMAIL_PASS=your-app-password
-EMAIL_FROM=Cayco <noreply@cayco.com>
+RESEND_API_KEY=re_xxxxxxxxxxxx
 FRONTEND_URL=https://your-frontend-domain.com
 ```
 
-## Gmail Setup (if using Gmail)
+### Optional
 
-1. Enable 2-Step Verification on your Google account
-2. Generate an App Password:
-   - Go to Google Account settings
-   - Security → 2-Step Verification → App passwords
-   - Generate a new app password for "Mail"
-   - Use this app password (not your regular password) as `EMAIL_PASS`
+- **RESEND_FROM** – Sender address. Format: `Cayco <noreply@yourdomain.com>`.  
+  If not set, defaults to `Cayco <onboarding@resend.dev>` (Resend’s test sender; only for development).
+- **EMAIL_FROM** – Same as `RESEND_FROM`; used as the “from” address if `RESEND_FROM` is not set.
+- **EMAIL_DEV_SKIP_SEND** – Set to `true` to skip sending; invite/reset links are logged to the console so you can open them in the browser. Useful when developing locally.
 
-## Other Email Providers
+## Setup Steps
 
-### For port 465 (SSL):
-```
-EMAIL_PORT=465
-```
-The system will automatically use `secure: true` for port 465.
+1. **Create a Resend account**  
+   Sign up at [resend.com](https://resend.com).
 
-### For port 587 (STARTTLS):
-```
-EMAIL_PORT=587
-```
-The system will automatically use `secure: false` with `requireTLS: true` for port 587.
+2. **Create an API key**  
+   - Go to [Resend → API Keys](https://resend.com/api-keys)  
+   - Create a key and copy it  
+   - Add it to `.env` as `RESEND_API_KEY=re_...`
 
-## Common SMTP Settings
+3. **Sender address**  
+   - **Development:** You can leave `RESEND_FROM` unset. Resend will use `onboarding@resend.dev` (their test domain).  
+   - **Production:**  
+     - In [Resend → Domains](https://resend.com/domains), add and verify your domain.  
+     - Set `RESEND_FROM=Cayco <noreply@yourdomain.com>` (or another address on that domain).
 
-### Gmail
-- Host: `smtp.gmail.com`
-- Port: `587` (STARTTLS) or `465` (SSL)
-- Requires App Password
+## Emails Sent by the Platform
 
-### Outlook/Office365
-- Host: `smtp.office365.com`
-- Port: `587`
-- Use your email and password
+- **Invite** – When a user is invited to join a company (link + Organization ID).
+- **Forgot Organization ID** – Sends the user’s organization IDs to their email.
+- **Password reset** – Link to reset password (scoped by organization).
+- **Registration** – Sent when onboarding is completed (welcome + Organization ID).
+- **Notifications** – In-app notifications can trigger emails (e.g. job created, invoice created) when the user has email notifications enabled.
 
-### SendGrid
-- Host: `smtp.sendgrid.net`
-- Port: `587`
-- User: `apikey`
-- Pass: Your SendGrid API key
-
-### Mailgun
-- Host: `smtp.mailgun.org`
-- Port: `587`
-- Use your Mailgun SMTP credentials
+All of these use the same Resend integration; no frontend changes are required.
 
 ## Troubleshooting
 
-### Connection timeout (ETIMEDOUT)
+1. **“Email service not configured”**  
+   Ensure `RESEND_API_KEY` is set in `.env` and the server was restarted after adding it.
 
-If you see `Connection timeout` or `ETIMEDOUT` when sending mail:
+2. **Resend returns an error**  
+   Check server logs for the Resend error message. Common causes:
+   - Invalid or revoked API key.
+   - Sender domain not verified (use `onboarding@resend.dev` for testing).
+   - Rate limits (see [Resend dashboard](https://resend.com/emails)).
 
-1. **Firewall / antivirus** – Windows Defender or other antivirus often blocks outbound SMTP. Temporarily allow Node/your app through the firewall or add an exception for outbound port 587 (or 465).
-2. **Port 587 blocked** – Many home ISPs block port 587. Try SSL on port 465:
-   - In `.env` set `EMAIL_PORT=465` (no quotes).
-   - Restart the backend. The app uses SSL automatically when port is 465.
-3. **No quotes in .env** – Use `EMAIL_HOST=smtp.gmail.com` not `EMAIL_HOST='smtp.gmail.com'`. Quotes can break the hostname.
-4. **Dev without real email** – To keep invites working when SMTP is blocked (e.g. on your PC), set in `.env`:
-   - `EMAIL_DEV_SKIP_SEND=true`
-   - The app will not connect to SMTP; it will log the invite/reset link to the console so you can copy it and open in the browser. Invites and registration still “succeed” in the UI.
+3. **Skip sending in development**  
+   Set `EMAIL_DEV_SKIP_SEND=true`. Invite and reset links will be printed in the console so you can open them without sending real email.
 
-### Other issues
-
-1. **Check environment variables** – Ensure `EMAIL_USER` and `EMAIL_PASS` are set (and, for Gmail, use an [App Password](https://support.google.com/accounts/answer/185833)).
-2. **Check logs** – Look for email error messages in server logs.
-3. **Verify SMTP** – Test the same host/port/user/pass in another client (e.g. Thunderbird) from the same network.
-4. **Port restrictions** – If 587 fails, try `EMAIL_PORT=465`.
-
-## Testing
-
-The email service verifies the connection on startup in production. Check server logs for:
-
-- `Email server is ready to send messages` (success)
-- `Email server verification failed` (check credentials/network)
+4. **Links point to wrong URL**  
+   Set `FRONTEND_URL` to your frontend base URL (e.g. `https://app.cayco.com` or `http://localhost:3000`). No trailing slash.

@@ -1,6 +1,6 @@
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
-// Trim env values (in case .env has quotes like EMAIL_HOST='smtp.gmail.com')
+// Trim env values (in case .env has quotes)
 const env = (key, def) => {
   const v = process.env[key];
   if (v == null || v === '') return def;
@@ -8,77 +8,31 @@ const env = (key, def) => {
   return trimmed || def;
 };
 
-// Determine if we should use secure connection (port 465) or STARTTLS (port 587)
-const emailPort = parseInt(env('EMAIL_PORT', '587'), 10);
-const useSecure = emailPort === 465;
+const apiKey = env('RESEND_API_KEY', '');
+const defaultFrom = env('RESEND_FROM', 'Cayco <onboarding@resend.dev>');
+const resend = apiKey ? new Resend(apiKey) : null;
 
-const transporter = nodemailer.createTransport({
-  host: env('EMAIL_HOST', 'smtp.gmail.com'),
-  port: emailPort,
-  secure: useSecure, // true for 465, false for other ports
-  auth: {
-    user: env('EMAIL_USER', ''),
-    pass: env('EMAIL_PASS', ''),
-  },
-  tls: {
-    rejectUnauthorized: process.env.EMAIL_TLS_REJECT_UNAUTHORIZED === 'true',
-  },
-  requireTLS: !useSecure,
-  // Longer timeouts for slow/firewalled networks (ETIMEDOUT often = firewall/ISP blocking SMTP)
-  connectionTimeout: 20000,
-  greetingTimeout: 15000,
-  socketTimeout: 25000,
-  pool: false, // avoid connection reuse issues that can cause timeouts
-  debug: process.env.NODE_ENV === 'development',
-  logger: process.env.NODE_ENV === 'development'
-});
-
-// Verify transporter configuration
-const verifyTransporter = async () => {
-  try {
-    await transporter.verify();
-    console.log('Email server is ready to send messages');
-    return true;
-  } catch (error) {
-    console.error('Email server verification failed:', error);
-    return false;
-  }
-};
-
-// Verify on startup (only in production to avoid blocking)
-if (process.env.NODE_ENV === 'production') {
-  verifyTransporter().catch(err => {
-    console.error('Email verification error:', err);
-  });
-}
-
-// When true, skip actual SMTP send and log content (for dev when SMTP is blocked by firewall/ISP)
+// When true, skip actual send and log content (for dev when you don't want to send real emails)
 const skipSend = process.env.EMAIL_DEV_SKIP_SEND === 'true' || process.env.EMAIL_DEV_SKIP_SEND === '1';
 
+/**
+ * Send an email via Resend API.
+ * @param {string} to - Recipient email
+ * @param {string} subject - Subject line
+ * @param {string} html - HTML body
+ * @returns {Promise<{ success: boolean, messageId?: string, error?: string }>}
+ */
 const sendEmail = async (to, subject, html) => {
   try {
-    const emailUser = env('EMAIL_USER', '');
-    const emailPass = env('EMAIL_PASS', '');
-
-    if (!emailUser || !emailPass) {
-      console.error('Email credentials not configured');
+    if (!apiKey || !resend) {
+      console.error('Resend API key not configured');
       return {
         success: false,
-        error: 'Email service not configured. Please set EMAIL_USER and EMAIL_PASS environment variables.'
+        error: 'Email service not configured. Please set RESEND_API_KEY in your environment.'
       };
     }
 
-    const mailOptions = {
-      from: env('EMAIL_FROM', '') || `Cayco <${emailUser}>`,
-      to,
-      subject,
-      html,
-      headers: {
-        'X-Priority': '1',
-        'X-MSMail-Priority': 'High',
-        'Importance': 'high'
-      }
-    };
+    const from = env('EMAIL_FROM', '') || defaultFrom;
 
     if (skipSend) {
       console.log('[EMAIL_DEV_SKIP_SEND] Skipping send. Would have sent:');
@@ -88,37 +42,39 @@ const sendEmail = async (to, subject, html) => {
       return { success: true, messageId: 'dev-skip' };
     }
 
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Email sent successfully:', info.messageId);
-    console.log('Email sent to:', to);
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error('Email sending error:', error);
-    console.error('Error details:', {
-      code: error.code,
-      command: error.command,
-      response: error.response,
-      responseCode: error.responseCode
+    const { data, error } = await resend.emails.send({
+      from,
+      to: [to],
+      subject,
+      html
     });
+
+    if (error) {
+      console.error('Resend email error:', error);
+      const errMsg = error?.message || (typeof error === 'object' ? JSON.stringify(error) : String(error));
+      return { success: false, error: errMsg };
+    }
+
+    console.log('Email sent successfully:', data?.id);
+    console.log('Email sent to:', to);
+    return { success: true, messageId: data?.id };
+  } catch (err) {
+    console.error('Email sending error:', err);
     return {
       success: false,
-      error: error.message,
-      details: process.env.NODE_ENV === 'development' ? error : undefined
+      error: err.message,
+      details: process.env.NODE_ENV === 'development' ? err : undefined
     };
   }
 };
 
 const sendInviteEmail = async (email, companyName, role, inviteToken, organizationId) => {
-  // Ensure FRONTEND_URL has a default for local development
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-  // Remove trailing slash if present
   const baseUrl = frontendUrl.replace(/\/$/, '');
   const inviteLink = `${baseUrl}/invite/${inviteToken}`;
-  
-  // Log for debugging (remove in production if needed)
+
   console.log('Invite link generated:', inviteLink);
-  console.log('FRONTEND_URL from env:', process.env.FRONTEND_URL);
-  
+
   const subject = `Invitation to join ${companyName} on Cayco`;
   const html = `
     <!DOCTYPE html>
@@ -217,7 +173,7 @@ const sendPasswordResetEmail = async (email, companyName, resetToken, organizati
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
   const baseUrl = frontendUrl.replace(/\/$/, '');
   const resetLink = `${baseUrl}/reset-password/${resetToken}`;
-  
+
   const subject = 'Reset Your Cayco Password';
   const html = `
     <!DOCTYPE html>
@@ -265,7 +221,7 @@ const sendRegistrationEmail = async (email, firstName, lastName, companyName, or
   const baseUrl = frontendUrl.replace(/\/$/, '');
   const loginUrl = `${baseUrl}/login`;
   const settingsUrl = `${baseUrl}/settings`;
-  
+
   const subject = 'Welcome to Cayco - Your Account Has Been Created Successfully';
   const html = `
     <!DOCTYPE html>

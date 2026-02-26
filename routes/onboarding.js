@@ -160,7 +160,7 @@ router.post('/complete-step', protect, async (req, res) => {
 });
 
 // @route   POST /api/onboarding/complete
-// @desc    Mark onboarding as complete
+// @desc    Mark onboarding as complete and send registration/welcome email with Organization ID
 // @access  Private
 router.post('/complete', protect, async (req, res) => {
   try {
@@ -171,97 +171,124 @@ router.post('/complete', protect, async (req, res) => {
       return res.status(404).json({ message: 'Company not found' });
     }
 
-    // Note: We keep user.onboardingCompleted for backward compatibility,
-    // but onboarding status is now checked per-organization via UserOrganization.registrationEmailSent
-    // We still set it to true here for any legacy checks, but the actual onboarding completion
-    // for an organization is determined by registrationEmailSent
+    // Ensure company has organizationId (pre-save hook sets it; reload if missing for legacy data)
+    if (!company.organizationId) {
+      await company.save();
+    }
+    const organizationId = company.organizationId;
+    if (!organizationId) {
+      console.error('Company missing organizationId:', company._id);
+    }
+
+    // Legacy: keep user.onboardingCompleted for backward compatibility
     if (!user.onboardingCompleted) {
       user.onboardingCompleted = true;
       await user.save();
     }
 
-    // Check if registration email has been sent for this specific organization
-    const userOrg = await UserOrganization.findOne({
+    // Find or create UserOrganization for this user+company so we can track registration email
+    let userOrg = await UserOrganization.findOne({
       userId: user._id,
       companyId: company._id
     });
+    if (!userOrg) {
+      userOrg = await UserOrganization.create({
+        userId: user._id,
+        companyId: company._id,
+        role: user.role || 'Company Owner',
+        status: 'active',
+        joinedAt: new Date(),
+        registrationEmailSent: false
+      });
+      console.log('✓ UserOrganization created for onboarding complete');
+    }
 
-    // Send registration confirmation email with organization ID when onboarding is completed
-    // Send email for each new organization, regardless of whether user completed onboarding for other organizations
-    const shouldSendEmail = !userOrg || userOrg.registrationEmailSent !== true;
-    
-    console.log(`Onboarding complete check for user ${user._id}, company ${company._id}:`, {
-      userOrgExists: !!userOrg,
-      registrationEmailSent: userOrg?.registrationEmailSent,
-      shouldSendEmail
-    });
+    // Always try to send registration email when they complete onboarding for this org,
+    // unless we already successfully sent it (so we don't send duplicates)
+    const shouldSendEmail = userOrg.registrationEmailSent !== true;
+    let emailSent = false;
 
-    if (shouldSendEmail) {
+    if (shouldSendEmail && organizationId) {
       try {
-        console.log(`Sending registration email for organization ${company.organizationId} to ${user.email}`);
+        console.log(`Sending registration email for organization ${organizationId} to ${user.email}`);
         const emailResult = await sendRegistrationEmail(
           user.email,
           user.firstName,
           user.lastName,
           company.name,
-          company.organizationId
+          organizationId
         );
-        
-        // Mark that registration email has been sent for this organization
-        // Do this regardless of email success/failure to mark onboarding as complete
-        if (userOrg) {
-          userOrg.registrationEmailSent = true;
-          userOrg.registrationEmailSentAt = new Date();
-          await userOrg.save();
-          console.log('✓ UserOrganization updated with registrationEmailSent = true');
+
+        if (emailResult.success) {
+          emailSent = true;
+          console.log('✓ Registration confirmation email sent successfully for organization:', organizationId);
         } else {
-          // Create UserOrganization entry if it doesn't exist (shouldn't happen, but just in case)
-          await UserOrganization.create({
-            userId: user._id,
-            companyId: company._id,
-            role: user.role || 'Company Owner',
-            status: 'active',
-            registrationEmailSent: true,
-            registrationEmailSentAt: new Date()
-          });
-          console.log('✓ UserOrganization created with registrationEmailSent = true');
-        }
-        
-        if (!emailResult.success) {
           console.error('Failed to send registration email:', emailResult.error);
-          // Don't fail onboarding completion if email fails, just log it
-        } else {
-          console.log('✓ Registration confirmation email sent successfully for organization:', company.organizationId);
         }
       } catch (emailError) {
         console.error('Error sending registration email:', emailError);
-        // Even if email fails, mark onboarding as complete
-        if (userOrg) {
-          userOrg.registrationEmailSent = true;
-          userOrg.registrationEmailSentAt = new Date();
-          await userOrg.save();
-        } else {
-          await UserOrganization.create({
-            userId: user._id,
-            companyId: company._id,
-            role: user.role || 'Company Owner',
-            status: 'active',
-            registrationEmailSent: true,
-            registrationEmailSentAt: new Date()
-          });
-        }
-        // Don't fail onboarding completion if email fails, just log it
       }
-    } else {
-      console.log(`Registration email already sent for organization ${company.organizationId}, skipping...`);
+      // Always mark registration email as "sent" for this org so onboarding is complete and we don't send duplicates.
+      // If send failed, user can use "Resend welcome email" from Settings.
+      userOrg.registrationEmailSent = true;
+      userOrg.registrationEmailSentAt = new Date();
+      await userOrg.save();
+    } else if (userOrg.registrationEmailSent === true) {
+      console.log(`Registration email already sent for organization ${organizationId}, skipping.`);
+    } else if (!organizationId) {
+      console.error('Cannot send registration email: company has no organizationId');
+      // Still mark onboarding complete so user is not stuck
+      userOrg.registrationEmailSent = true;
+      userOrg.registrationEmailSentAt = new Date();
+      await userOrg.save();
     }
+
+    const onboardingCompleted = userOrg.registrationEmailSent === true;
 
     res.json({
       success: true,
-      message: 'Onboarding completed'
+      message: 'Onboarding completed',
+      emailSent,
+      onboardingCompleted
     });
   } catch (error) {
+    console.error('Onboarding complete error:', error);
     res.status(400).json({ message: error.message });
+  }
+});
+
+// @route   POST /api/onboarding/resend-welcome-email
+// @desc    Resend registration/welcome email with Organization ID (e.g. if it failed on complete)
+// @access  Private
+router.post('/resend-welcome-email', protect, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    const company = await Company.findById(req.user.companyId);
+    if (!company) {
+      return res.status(404).json({ message: 'Company not found' });
+    }
+    if (!company.organizationId) {
+      await company.save();
+    }
+    const organizationId = company.organizationId;
+    if (!organizationId) {
+      return res.status(400).json({ message: 'Company has no Organization ID. Please contact support.' });
+    }
+    const emailResult = await sendRegistrationEmail(
+      user.email,
+      user.firstName,
+      user.lastName,
+      company.name,
+      organizationId
+    );
+    if (!emailResult.success) {
+      console.error('Resend welcome email failed:', emailResult.error);
+      return res.status(500).json({ message: 'Failed to send email. Please try again later.', emailSent: false });
+    }
+    return res.json({ success: true, message: 'Welcome email sent. Check your inbox.', emailSent: true });
+  } catch (error) {
+    console.error('Resend welcome email error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to send email' });
   }
 });
 
